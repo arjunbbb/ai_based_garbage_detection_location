@@ -1,0 +1,221 @@
+
+#include <trash_image_classification_inferencing.h>
+
+#include <TinyGPS++.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ================= WIFI =================
+const char* ssid = "Arjun";
+const char* password = "123456789";
+
+WebServer server(80);
+TinyGPSPlus gps;
+
+// ================= SERIAL =================
+HardwareSerial camSerial(1);
+HardwareSerial gpsSerial(2);
+
+// ================= BUFFERS =================
+uint8_t image_buf[20000];        
+uint8_t detected_img_buf[20000]; 
+size_t detected_img_len = 0;
+
+// ================= STATE =================
+char gps_location[32] = "18.7758,78.9042";
+bool garbage_detected = false;
+
+// ================= WEB =================
+void handle_root() {
+
+  String html = R"rawliteral(
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      body { font-family: Arial; text-align: center; background:#f2f2f2; }
+      .card { background:white; padding:20px; margin:30px auto; width:90%; max-width:400px; border-radius:10px; box-shadow:0 0 10px rgba(0,0,0,0.2);}
+      img { width:100%; border-radius:10px; }
+      .btn { padding:10px 15px; background:#007BFF; color:white; text-decoration:none; border-radius:5px; }
+    </style>
+  </head>
+  <body>
+  <div class="card">
+  <h2>Garbage Detection</h2>
+  )rawliteral";
+
+  if (garbage_detected && detected_img_len > 0) {
+
+    html += "<p><b>Status:</b> Garbage Detected</p>";
+    html += "<p><b>GPS:</b> " + String(gps_location) + "</p>";
+
+    html += "<a class='btn' href='https://maps.google.com/?q=";
+    html += gps_location;
+    html += "' target='_blank'>Open Maps</a><br><br>";
+
+    html += "<img src='/capture'>";
+
+  } else {
+    html += "<p>No garbage detected yet</p>";
+  }
+
+  html += "</div></body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+// ================= FIXED IMAGE HANDLER =================
+void handle_capture() {
+
+  if (detected_img_len == 0) {
+    server.send(404, "text/plain", "No image");
+    return;
+  }
+
+  WiFiClient client = server.client();
+
+  // Proper HTTP response
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: image/jpeg");
+  client.print("Content-Length: ");
+  client.println(detected_img_len);
+  client.println("Connection: close");
+  client.println();
+
+  // Send image
+  client.write(detected_img_buf, detected_img_len);
+}
+
+// ================= AI =================
+float get_pixel(uint8_t *buf, int x, int y, int w) {
+  int index = (y * w + x) * 2;
+
+  uint16_t pixel = (buf[index] << 8) | buf[index + 1];
+
+  uint8_t r = ((pixel >> 11) & 0x1F) << 3;
+  uint8_t g = ((pixel >> 5) & 0x3F) << 2;
+  uint8_t b = (pixel & 0x1F) << 3;
+
+  return (r + g + b) / 3.0f;
+}
+
+void run_ai(int img_len) {
+
+  signal_t signal;
+  signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
+
+  signal.get_data = [&](size_t offset, size_t length, float *out_ptr) {
+    for (size_t i = 0; i < length; i++) {
+      int x = i % EI_CLASSIFIER_INPUT_WIDTH;
+      int y = i / EI_CLASSIFIER_INPUT_WIDTH;
+      out_ptr[i] = get_pixel(image_buf, x, y, 160);
+    }
+    return 0;
+  };
+
+  ei_impulse_result_t result = {0};
+
+  if (run_classifier(&signal, &result, false) != EI_IMPULSE_OK) {
+    Serial.println(" AI Error");
+    return;
+  }
+
+  bool detected_now = false;
+
+  for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+  Serial.println("AI Result:");
+  for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+    Serial.print(result.classification[i].label);
+    Serial.print(": ");
+    Serial.println(result.classification[i].value);
+  }
+  Serial.println("------");
+    if (strcmp(result.classification[i].label, "garbage") == 0 &&
+        result.classification[i].value > 0.40) {
+      detected_now = true;
+    }
+  }
+
+  if (detected_now) {
+
+    Serial.println(" GARBAGE DETECTED");
+
+    garbage_detected = true;
+
+    // SAFE COPY
+    if (img_len > 0 && img_len <= sizeof(detected_img_buf)) {
+      memcpy(detected_img_buf, image_buf, img_len);
+      detected_img_len = img_len;
+    } else {
+      Serial.println(" Image too large");
+      return;
+    }
+
+    camSerial.println("SAVE");
+
+    if (gps.location.isValid()) {
+      snprintf(gps_location, sizeof(gps_location),
+               "%.6f,%.6f",
+               gps.location.lat(),
+               gps.location.lng());
+    }
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+
+  Serial.begin(115200);
+
+  camSerial.begin(115200, SERIAL_8N1, 16, 17);
+  gpsSerial.begin(9600, SERIAL_8N1, 4, 2);
+
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+
+  Serial.println(WiFi.localIP());
+
+  server.on("/", handle_root);
+  server.on("/capture", handle_capture);
+  server.begin();
+}
+
+// ================= LOOP =================
+void loop() {
+
+  server.handleClient();
+
+  while (gpsSerial.available()) {
+    gps.encode(gpsSerial.read());
+  }
+
+  if (camSerial.available() >= 7) {
+
+    if (camSerial.read() == 'I' &&
+        camSerial.read() == 'M' &&
+        camSerial.read() == 'G') {
+
+      int len = 0;
+
+      camSerial.readBytes((char*)&len, 4);
+
+      if (len <= 0 || len > sizeof(image_buf)) {
+        Serial.println(" Invalid image size");
+        return;
+      }
+
+      size_t received = camSerial.readBytes((char*)image_buf, len);
+
+      if (received != len) {
+        Serial.println(" Incomplete image");
+        return;
+      }
+
+      Serial.println(" Image received");
+
+      run_ai(len);
+    }
+  }
+}
